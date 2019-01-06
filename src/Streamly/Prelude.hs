@@ -702,9 +702,14 @@ fromFoldableM = Prelude.foldr consM K.nil
 each :: (IsStream t, Foldable f) => f a -> t m a
 each = K.fromFoldable
 
+-- XXX define fromHandle/fromHandleLn in Streamly.String
+-- Also define encode/decodeUtf8 there
+-- As well as decode/encode for auto decode and encode based on environment
+--
 -- | Read lines from an IO Handle into a stream of Strings.
 --
 -- @since 0.1.0
+{-# DEPRECATED fromHandle "Please use \"map lines fromHandleChar\" instead." #-}
 fromHandle :: (IsStream t, MonadIO m) => IO.Handle -> t m String
 fromHandle h = go
   where

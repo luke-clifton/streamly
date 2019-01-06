@@ -155,6 +155,7 @@ library
                      , Streamly.Streams.StreamD
                      , Streamly.Streams.Prelude
 
+
                     -- Higher level streams
                      , Streamly.Streams.SVar
                      , Streamly.Streams.Serial
@@ -172,6 +173,8 @@ library
                      , Streamly
                      , Streamly.Tutorial
                      , Streamly.Internal
+                     , Streamly.FileIO
+                     , Streamly.Buffer
 
     default-language: Haskell2010
     ghc-options:      -Wall -fspec-constr-recursive=10
