@@ -174,7 +174,7 @@ library
                      , Streamly.Tutorial
                      , Streamly.Internal
                      , Streamly.FileIO
-                     , Streamly.Buffer
+                     , Streamly.Vector
 
     default-language: Haskell2010
     ghc-options:      -Wall -fspec-constr-recursive=10
