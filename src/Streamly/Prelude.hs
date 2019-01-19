@@ -1,4 +1,5 @@
 {-# LANGUAGE CPP                       #-}
+{-# LANGUAGE RankNTypes                       #-}
 {-# LANGUAGE FlexibleContexts          #-}
 
 #if __GLASGOW_HASKELL__ >= 800
@@ -342,6 +343,7 @@ module Streamly.Prelude
     , scan
     , foldl
     , foldlM
+    , foldGroupN
     )
 where
 
@@ -702,10 +704,6 @@ fromFoldableM = Prelude.foldr consM K.nil
 each :: (IsStream t, Foldable f) => f a -> t m a
 each = K.fromFoldable
 
--- XXX define fromHandle/fromHandleLn in Streamly.String
--- Also define encode/decodeUtf8 there
--- As well as decode/encode for auto decode and encode based on environment
---
 -- | Read lines from an IO Handle into a stream of Strings.
 --
 -- @since 0.1.0
@@ -1212,6 +1210,15 @@ concatMap f m = fromStreamD $ D.concatMap (toStreamD . f) (toStreamD m)
 {-# INLINE concatMapM #-}
 concatMapM :: (IsStream t, Monad m) => (a -> m (t m b)) -> t m a -> t m b
 concatMapM f m = fromStreamD $ D.concatMapM (fmap toStreamD . f) (toStreamD m)
+
+-- | Group the input stream into groups of @n@ elements each and the fold each
+-- group using the provided fold function.
+--
+-- @since 0.7.0
+{-# INLINE foldGroupN #-}
+foldGroupN :: (IsStream t, Monad m)
+    => Int -> (forall n. Monad n => t n a -> n b) -> t m a -> t m b
+foldGroupN n f m = fromStreamD $ D.foldGroupN n (f . fromStreamD) (toStreamD m)
 
 ------------------------------------------------------------------------------
 -- Substreams

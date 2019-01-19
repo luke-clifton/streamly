@@ -111,8 +111,11 @@ module Streamly.Streams.StreamD
     , findM
     , find
     , (!!)
+
+    -- ** Flattening nested streams
     , concatMapM
     , concatMap
+    , foldGroupN
 
     -- ** Substreams
     , isPrefixOf
@@ -191,13 +194,15 @@ module Streamly.Streams.StreamD
     )
 where
 
+import Control.Monad.Trans (lift)
+import Control.Monad.Trans.State.Lazy (StateT(..), get, put)
 import Data.Maybe (fromJust, isJust)
 import GHC.Types ( SPEC(..) )
 import Prelude
        hiding (map, mapM, mapM_, repeat, foldr, last, take, filter,
                takeWhile, drop, dropWhile, all, any, maximum, minimum, elem,
                notElem, null, head, tail, zipWith, lookup, foldr1, sequence,
-               (!!), scanl, scanl1, concatMap, replicate, enumFromTo)
+               (!!), scanl, scanl1, concatMap, replicate, enumFromTo, concat)
 
 import Streamly.SVar (MonadAsync, defState, adaptState)
 
@@ -805,6 +810,101 @@ concatMapM f (Stream step state) = Stream step' (Left state)
 {-# INLINE concatMap #-}
 concatMap :: Monad m => (a -> Stream m b) -> Stream m a -> Stream m b
 concatMap f = concatMapM (return . f)
+
+-- XXX call it foldGroups/foldGroupsBy?
+{-# INLINE foldGroupN #-}
+foldGroupN
+    :: Monad m
+    => Int
+    -> (forall n. Monad n => Stream n a -> n b)
+    -> Stream m a
+    -> Stream m b
+foldGroupN n f (Stream step state) =
+    n `seq` Stream stepOuter (Just (state, Right 0))
+
+    where
+
+    {-# INLINE_LATE stepOuter #-}
+    stepOuter gst (Just (st, Right 0)) = do
+        res <- step (adaptState gst) st
+        case res of
+            Yield x s -> do
+                (r, s') <- runStateT (f (Stream stepInner undefined))
+                                     (Just (s, Left x))
+                return $ Yield r s'
+            Skip s    -> return $ Skip $ Just (s, Right 0)
+            Stop      -> return Stop
+
+    stepOuter _ (Just (st, Right i)) | i >= n =
+        return $ Skip (Just (st, Right 0))
+
+    -- drain the stream not used by the previous fold.
+    stepOuter gst (Just (st, Right i)) = do
+        res <- step (adaptState gst) st
+        return $ case res of
+            Yield _ s -> Skip (Just (s, Right $ i + 1))
+            Skip s    -> Skip (Just (s, Right i))
+            Stop      -> Stop
+
+    stepOuter _ Nothing = do
+        return Stop
+
+    stepOuter _ (Just (_, (Left _))) = error "Cannot happen"
+
+    -- XXX pass on gst instead of using defState?
+    -- XXX After a complete chunk we are folding a nil stream but not using the
+    -- result, this could be problematic if the nil fold actually produces a
+    -- side effect. To avoid this we have to first try to yield a result in the
+    -- parent stream and if the result in non-nil only then we should try a
+    -- fold.
+    --
+    -- XXX instead of using the state in step we can just use the state from
+    -- the state monad, that way we can remove the undefined as well.
+    {-# INLINE_LATE stepInner #-}
+    {-
+    stepInner _ (st, Left x) =
+        let ss = (st, Right 1)
+         in put (Just ss) >> (return $ Yield x ss)
+
+    stepInner gst (st, Right i) | i < n = do
+        r <- lift $ step defState st
+        case r of
+            Yield x s -> let ss = (s, Right $ i + 1)
+                          in put (Just ss) >> (return $ Yield x ss)
+            Skip s    -> let ss = (s, Right i)
+                          in put (Just ss) >> (return $ Skip ss)
+            Stop      -> put Nothing >> return Stop
+
+    stepInner _ (st, _) = put (Just (st, Right 0)) >> return Stop
+    -}
+    stepInner _ _ = do
+        maybSt <- get
+        case maybSt of
+            Just (st, counter) ->
+                case counter of
+                    Left x -> do
+                        let ss = (st, Right 1)
+                        put $ Just ss
+                        return $ Yield x ss
+                    Right i | i < n -> do
+                        -- XXX can we use gst instead of defState?
+                        r <- lift $ step defState st
+                        case r of
+                            Yield x s -> do
+                                let ss = (s, Right $ i + 1)
+                                put $ Just ss
+                                return $ Yield x ss
+                            Skip s -> do
+                                let ss = (s, Right i)
+                                put $ Just ss
+                                return $ Skip ss
+                            Stop -> do
+                                put Nothing
+                                return Stop
+                    _ -> do
+                        put $ Just (st, Right 0)
+                        return Stop
+            Nothing -> error "cannot happen"
 
 ------------------------------------------------------------------------------
 -- Substreams

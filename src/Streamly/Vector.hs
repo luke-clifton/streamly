@@ -1,7 +1,9 @@
-{-# LANGUAGE CPP #-}
 {-# LANGUAGE BangPatterns #-}
+{-# LANGUAGE CPP #-}
 {-# LANGUAGE MagicHash #-}
+{-# LANGUAGE RecordWildCards #-}
 {-# LANGUAGE UnboxedTuples #-}
+{-# LANGUAGE ScopedTypeVariables #-}
 
 #include "Streams/inline.hs"
 
@@ -14,140 +16,74 @@
 -- Stability   : experimental
 -- Portability : GHC
 --
+-- Vectors are chunks of memory that can hold a /finite/ sequence of values of
+-- the same type. Unlike streams vectors are /finite/ and therefore most of the
+-- APIs dealing with vectors specify the size of the vector. The size of a
+-- vector is pre-determined unlike streams where we need to compute the length
+-- by traversing the entire stream.
+--
+-- Most importantly, vectors as implemented in this module, use memory that is
+-- out of the ambit of GC and therefore add no pressure to GC. Moreover, they
+-- can be used to communicate with foreign consumers and producers (e.g. file
+-- and network IO) with zero copy.
+--
+-- Vectors help reduce GC pressure when we want to hold large amounts of data
+-- in memory. Too many small vectors (e.g. single byte) are only as good as
+-- holding data in a Haskell list. However, small vectors can be compacted into
+-- large ones to reduce the overhead. To hold 32GB memory in 32k sized buffers
+-- we need 1 million vectors. This is still significant to add pressure to GC.
+-- However, we can create vectors of vectors (trees) to scale to arbitrarily
+-- large amounts of memory but still using small chunks of contiguous memory.
 
-module Streamly.Vector
-    (
-      Vector (..)
-    , resizeVector
-    , sizeOfVector
-    , toWord8Stream
-    , fromWord8Stream
-    , defaultChunkSize
-    )
-where
+-------------------------------------------------------------------------------
+-- Design Notes
+-------------------------------------------------------------------------------
 
-import Control.Monad.IO.Class (MonadIO(..))
-import Data.Word (Word8)
-{-
-import GHC.ForeignPtr  (ForeignPtr(ForeignPtr)
-                       ,newForeignPtr_, mallocPlainForeignPtrBytes)
--}
-import Foreign.C.Types (CSize(..))
-import Foreign.ForeignPtr (ForeignPtr, withForeignPtr, touchForeignPtr)
-import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
-import Foreign.Ptr (Ptr, plusPtr, minusPtr)
-import Foreign.Storable (Storable(..))
-import GHC.Base (realWorld#)
-import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
-import GHC.IO (IO(IO))
-import System.IO (Handle, hGetBufSome, hPutBuf) -- , hSeek, SeekMode(..))
-import System.IO.Unsafe (unsafePerformIO)
+-- There are two goals that we need to fulfill and use vectors to fulfill them.
+-- One, holding large amounts of data in non-GC memory, two, allow random
+-- access to elements based on index. The first ones fall in the category of
+-- storage buffers while the second ones fall in the category of
+-- maps/multisets/hashmaps.
+--
+-- For the first requirement we use a vector of Storables. We can have both
+-- immutable and mutable variants of this vector using wrappers over the same
+-- underlying type.
+--
+-- For the second requirement we can provide a vector of polymorphic elements
+-- that need not be Storable instances. In that case we need to use an Array#
+-- instead of a ForeignPtr. This type of vector would not reduce the GC
+-- overhead as much because each element of the array still needs to be scanned
+-- by the GC.  However, this would allow random access to the elements. But in
+-- most cases random access means storage, and it means we need to avoid GC
+-- scanning except in cases of trivially small storage. One way to achieve that
+-- would be to put the array in a Compact region. However, when we mutate this
+-- we will have to use a manual GC copying out to another CR and freeing the
+-- old one.
 
-import qualified Streamly.Prelude as S
+-------------------------------------------------------------------------------
+-- SIMD Vectors
+-------------------------------------------------------------------------------
 
-import Streamly.SVar (adaptState)
-import Streamly.Streams.Serial (SerialT)
-import Streamly.Streams.StreamK.Type (IsStream, mkStream)
-import qualified Streamly.Streams.StreamD.Type as D
-import qualified Streamly.Streams.StreamD as D
+-- XXX Try using SIMD operations where possible to combine vectors and to fold
+-- vectors. For example computing checksums of streams, adding streams or
+-- summing streams.
+
+-------------------------------------------------------------------------------
+-- Caching coalescing/batching
+-------------------------------------------------------------------------------
 
 -- XXX we can use address tags in IO buffers to coalesce multiple buffers into
--- fewer IO requests. Similalrly we can split responses to serve them to the
+-- fewer IO requests. Similarly we can split responses to serve them to the
 -- right consumers. This will be comonadic. A common buffer cache can be
 -- maintained which can be shared by many consumers.
 --
 -- XXX we can also have IO error monitors attached to streams. to monitor disk
 -- or network errors or latencies and then take actions for example starting a
 -- disk scrub or switching to a different location on the network.
---
+
 -------------------------------------------------------------------------------
--- Vectors
+-- Representation notes
 -------------------------------------------------------------------------------
-
--- Vectors are chunks of memory that can hold arbitrary values, but usually
--- used to hold self-contained data structures fully evaluated and serialized
--- to Word8 arrays from Haskell values. Vectors use memory that is out of the
--- ambit of GC and therefore add no pressure to GC other than the Vector
--- pointer itself.
---
--- Vectors help when we want to hold large amounts of data. Too many small
--- buffers (e.g. single byte) are only as good as holding data in a Haskell
--- list. However, small buffers can be compacted into large ones to reduce the
--- overhead. To hold 32GB memory in 32k sized buffers we will need 1 million
--- buffers.  This is still significant to add pressure to GC. If we want to
--- hold such large amounts of data outside GC then we can implement chained
--- buffers i.e.  a linked list of buffers in non-GC memory.
---
--- We can also use a "Compact a" type for a compact region buffer
--- Do we need an alignment argument?
--- XXX add reverse flag to reverse the bytes
--- if we use "Buffer a/Vector a" where a is of fixed size i.e. it does not have
--- a recursive structure (and if we can determine and enforce that at compile
--- time) then we can reverse any vector of a without doing anything.
--- We can use a vector like typeclass to abstract the operations and only fixed
--- size types are made instances of it.
--- When converting a stream to a buffer we statically know the size of an
--- element and we can determine how many elements we need to collect in one
--- chunk so that we can allocate in fixed size chunks rather than growing one
--- element at a time.
-data Vector = Vector {-# UNPACK #-} !(ForeignPtr Word8)
-                     {-# UNPACK #-} !Int
-
-sizeOfVector :: Vector -> Int
-sizeOfVector (Vector _ s) = s
-
-foreign import ccall unsafe "string.h memcpy" c_memcpy
-    :: Ptr Word8 -> Ptr Word8 -> CSize -> IO (Ptr Word8)
-
-memcpy :: Ptr Word8 -> Ptr Word8 -> Int -> IO ()
-memcpy p q s = c_memcpy p q (fromIntegral s) >> return ()
-
-resizeVector :: Ptr Word8 -> Int -> Int -> IO Vector
-resizeVector pOld oldSize newSize = do
-    newPtr <- mallocPlainForeignPtrBytes newSize
-    withForeignPtr newPtr $ \pNew -> do
-        memcpy pNew pOld (min newSize oldSize)
-        return $! Vector newPtr newSize
-
--- | GHC memory management allocation header overhead
-allocOverhead :: Int
-allocOverhead = 2 * sizeOf (undefined :: Int)
-
--- | Default buffer size in bytes. Account for the GHC memory allocation
--- overhead so that the actual allocation is rounded to page boundary.
-defaultChunkSize :: Int
-defaultChunkSize = 320 * k - allocOverhead
-   where k = 1024
-
-{-
--- We do not provide ways to combine or operate on buffers directly as it will
--- involve a copy. The only way to combine buffers is via streams, we can
--- create a stream of buffers, concat it and serialize it again to a new
--- buffer. This way it is explicit that we are recreating a buffer.  When
--- serializing a stream of buffers to a single buffer we can use memcpy to copy
--- each buffer into the destination buffer.
-
--- we can just use a fold using Monoid
--- concatBuffers :: t m Buffer -> m Buffer
-splitBuffer :: Int -> Buffer -> t m Buffer
-splitBuffer maxSize buf =
-
--- compactBuffers :: Int -> Int -> t m Buffer -> t m Buffer
--- compactBuffers minSize tolerance =
---
--- deCompactBuffers :: Int -> Int -> t m Buffer -> t m Buffer
--- deCompactBuffers maxSize tolerance =
-
--- When each IO opration has a significant system overhead, it may be more
--- efficient to do gather IO. But when the buffers are too small we may want to
--- copy multiple of them in a single buffer rather than setting up a gather
--- list. A gather list may have more overhead compared to just copying. If the
--- buffer is larger than a limit we may just keep a single buffer in a gather
--- list.
---
--- gatherBuffers :: Int -> t m Buffer -> t m GatherBuffer
--- gatherBuffers maxLimit bufs =
--}
 
 -- XXX we can use newtype over stream for buffers. That way we can implement
 -- operations like length as a fold of length of all underlying buffers.
@@ -158,88 +94,198 @@ splitBuffer maxSize buf =
 -- linked list in the non-gc memory. This will allow unlimited size buffers to
 -- be stored.
 --
--- A vector is a special type of buffer which serializes only the top level
--- array and not the elements. So a "Buffer a" would in fact be a vector and
--- "Buffer" would be a "Buffer Word8". So a vector becomes a special case of a
--- single large Buffer.
---
--- In the vector implementation, we can start with building it as a stream and
--- compact it after a threshold is reached. That way we do not have to
--- reallocate memory too often and we also do not have to allocate a chunk
--- upfront. It would be a stream of buffers and a buffer's representation could
--- be either as a stream or as an array. We will have to store the count of
--- elements even in a streamed representation. This could work well in general
--- without having to know whether we are storing or not. If the stream becomes
--- larger than one segment then we would compress/serialize the pervious
--- segement before adding a new segment. If the number of these buffers becomes
--- too large then we can again compress many of them into a larger bucket. That
--- way we can build a tree incrementally. And aggregation information like
--- space accounting (length of the buffer/index) can be kept at each node. That
--- way we can address any element by its index quickly even if it is not really
--- a completely flat array. We can also insert randomly if we make this a sort
--- of B+ tree.
+-- Unified Vector + Stream:
+-- We can use a "Vector" as the unified stream structure. When we use a cons we
+-- can increase the count of buffered elements in the stream, when we use
+-- uncons we decrement the count. If the count goes beyond a threshold we
+-- vectorize the buffered part. So if we are accessing an index at the end of
+-- the stream and still want to hold on to the stream elements then we would be
+-- buffering it by consing the elements and therefore automatically vectorizing
+-- it. By consing we are joining an evaluated part with a potentially
+-- unevaluated tail therefore strictizing the stream. When we uncons we are
+-- actually taking out a vector (i.e. evaluated part, WHNF of course) from the
+-- stream.
+
+module Streamly.Vector
+    (
+      Vector (..)
+    , resizePtr
+    , length
+
+    -- * Construction/Generation
+    , readHandleWith
+    , bufferN
+
+    -- * Elimination/Folds
+    , writeHandle
+    , vConcat
+    )
+where
+
+import Control.Monad.IO.Class (MonadIO(..))
+import Data.Int (Int64)
+import Data.Word (Word8)
+import Foreign.C.Types (CSize(..))
+import Foreign.ForeignPtr
+       (ForeignPtr, withForeignPtr, touchForeignPtr)
+import Foreign.ForeignPtr.Unsafe (unsafeForeignPtrToPtr)
+import Foreign.Ptr (Ptr, plusPtr, minusPtr, castPtr)
+import Foreign.Storable (Storable(..))
+import GHC.Base (realWorld#)
+import GHC.ForeignPtr (mallocPlainForeignPtrBytes)
+import GHC.IO (IO(IO))
+import System.IO (Handle, hGetBufSome, hPutBuf)
+import System.IO.Unsafe (unsafePerformIO)
+import Prelude hiding (length)
+
+import Streamly.SVar (adaptState)
+import Streamly.Streams.Serial (SerialT)
+import Streamly.Streams.StreamK.Type (IsStream, mkStream)
+
+import qualified Streamly.Prelude as S
+import qualified Streamly.Streams.StreamD.Type as D
+import qualified Streamly.Streams.StreamD as D
 
 -------------------------------------------------------------------------------
--- Converting buffers to and from streams of Word8
+-- Utility functions
+-------------------------------------------------------------------------------
+
+foreign import ccall unsafe "string.h memcpy" c_memcpy
+    :: Ptr Word8 -> Ptr Word8 -> CSize -> IO (Ptr Word8)
+
+-- XXX we are converting Int to CSize
+memcpy :: Ptr Word8 -> Ptr Word8 -> Int -> IO ()
+memcpy p q s = c_memcpy p q (fromIntegral s) >> return ()
+
+-------------------------------------------------------------------------------
+-- Vector Data Type
+-------------------------------------------------------------------------------
+
+-- Storable a
+-- data Vector a =
+--    VBlock Int (ForeignPtr a)
+--  | VTree  Int Int (Vector (Vector a)) -- VTree Size TreeLevel Tree
+--
+-- The VBlock constructor can be thought of as a stream of single vector.
+-- VTree can make the structure hierarchical, we can have vectors inside
+-- vectors up to many levels making it a tree. The level of the tree depends on
+-- the block size of the vector. We can reduce the level by increasing the
+-- block size.
+--
+-- The block size of a chunk can either be constant or variable. Constant block
+-- size would require compacting, whereas variable block size would require
+-- more work when searching/accessing an element. To reduce the access overhead
+-- we can use a B+ tree for variable sized blocks.
+--
+-- Use rewrite rules to rewrite vector from and to stream ops to id.
+
+-- XXX Do we need some alignment for the allocations?
+-- XXX add reverse flag to reverse the contents without actually reversing.
+data Vector a = Vector
+    { vPtr  :: {-# UNPACK #-} !(ForeignPtr a)
+    , vLen  :: {-# UNPACK #-} !Int   -- number of items of type a
+    , vSize :: {-# UNPACK #-} !Int   -- allocated buffer size in bytes
+                                     -- XXX in terms of count of 'a' instead?
+    }
+
+type ByteVector = Vector Word8
+
+length :: Vector a -> Int
+length = vLen
+
+-- sizeOf :: Vector a -> Int
+-- sizeOf = vSize
+
+resizePtr :: Int -> Ptr a -> Int -> Int -> IO (Vector a)
+resizePtr len pOld oldSize newSize = do
+    newPtr <- mallocPlainForeignPtrBytes newSize
+    withForeignPtr newPtr $ \pNew -> do
+        memcpy (castPtr pNew) (castPtr pOld) (min newSize oldSize)
+        return $! Vector {vPtr = newPtr, vLen = len, vSize = newSize}
+
+-- XXX can we remove the IO monad requirement
+shrink :: forall a. Storable a => Vector a -> IO (Vector a)
+shrink Vector{..} = do
+    let newSize = vLen * sizeOf (undefined :: a)
+    newPtr <- mallocPlainForeignPtrBytes newSize
+    withForeignPtr vPtr $ \pOld -> do
+        withForeignPtr newPtr $ \pNew -> do
+            memcpy (castPtr pNew) (castPtr pOld) newSize
+            return $! Vector {vPtr = newPtr, vLen = vLen, vSize = newSize}
+
+-------------------------------------------------------------------------------
+-- Construction/generation of a stream of vectors
+-------------------------------------------------------------------------------
+
+-- | Read a 'ByteVector' from a file handle. If no data is available on the
+-- handle it blocks until some data becomes available. If data is available
+-- then it immediately returns that data without blocking. It reads a maximum
+-- of up to the size requested.
+{-# INLINE fromHandleSome #-}
+fromHandleSome :: Int -> Handle -> IO ByteVector
+fromHandleSome size h = do
+    ptr <- mallocPlainForeignPtrBytes size
+    withForeignPtr ptr $ \p -> do
+        n <- hGetBufSome h p size
+        case compare n size of
+            EQ -> return $! Vector {vPtr = ptr, vLen = n, vSize = size}
+            -- XXX resizePtr only if the diff is significant
+            LT -> resizePtr n p size n
+            GT -> error "Panic: hGetBufSome read more than the size of buf"
+
+-- | @readHandleWith size h@ reads a stream of vectors from file handle @h@.
+-- The maximum size of a single vector is limited to @size@.
+{-# INLINE readHandleWith #-}
+readHandleWith :: (IsStream t, MonadIO m) => Int -> Handle -> t m ByteVector
+readHandleWith size h = go
+  where
+    -- XXX use cons/nil instead
+    go = mkStream $ \_ yld sng _ -> do
+        vec <- liftIO $ fromHandleSome size h
+        if length vec < size
+        then sng vec
+        else yld vec go
+
+-------------------------------------------------------------------------------
+-- Buffer streams into vectors
 -------------------------------------------------------------------------------
 
 {-# INLINE accursedUnutterablePerformIO #-}
 accursedUnutterablePerformIO :: IO a -> a
 accursedUnutterablePerformIO (IO m) = case m realWorld# of (# _, r #) -> r
 
--- toStreamWord16/32/64
--- fromStreamWord16/32/64
--- use concatMap toStreamWord8 to convert a stream of buffers to stream of
--- Word8
-{-# INLINE toWord8StreamD #-}
-toWord8StreamD :: Monad m => Vector -> D.Stream m Word8
-toWord8StreamD (Vector fptr len) =
-    -- XXX use foldr for buffer
-    let p = unsafeForeignPtrToPtr fptr
-    in D.Stream step (p, p `plusPtr` len)
-
-    where
-
-    {-# INLINE_LATE step #-}
-    step _ (p, end) | p == end = return D.Stop
-    step _ (p, end) =
-        let !x = peekFptr fptr p
-        in return $ D.Yield x (p `plusPtr` 1, end)
-
-    {-# INLINE peekFptr #-}
-    peekFptr fp p = accursedUnutterablePerformIO $ do
-        x <- peek p
-        touchForeignPtr fp
-        return x
-
-{-# INLINE toWord8Stream #-}
-toWord8Stream :: (IsStream t, Monad m) => Vector -> t m Word8
-toWord8Stream buf = D.fromStreamD $ toWord8StreamD buf
-
-data Word8ToVectorState =
+data ToVectorState a =
       BufAlloc
-    | BufWrite (ForeignPtr Word8) (Ptr Word8) (Ptr Word8)
+    | BufWrite (ForeignPtr a) (Ptr a) (Ptr a)
     | BufStop
 
 -- XXX we should never have zero sized chunks if we want to use "null" on a
 -- stream of buffers to mean that the stream itself is null.
-{-# INLINE fromWord8StreamD #-}
-fromWord8StreamD :: Monad m => Int -> D.Stream m Word8 -> D.Stream m Vector
-fromWord8StreamD bufSize (D.Stream step state) =
+--
+-- n is the number of items in each generated vector.
+{-# INLINE toVectorStreamD #-}
+toVectorStreamD
+    :: forall m a.
+       (Monad m, Storable a)
+    => Int -> D.Stream m a -> D.Stream m (Vector a)
+toVectorStreamD n (D.Stream step state) =
     D.Stream step' (state, BufAlloc)
 
     where
 
+    size = n * sizeOf (undefined :: a)
+
     {-# INLINE_LATE step' #-}
     step' _ (st, BufAlloc) =
         let !res = unsafePerformIO $ do
-                fptr <- mallocPlainForeignPtrBytes bufSize
+                fptr <- mallocPlainForeignPtrBytes size
                 let p = unsafeForeignPtrToPtr fptr
-                return $ D.Skip $ (st, BufWrite fptr p (p `plusPtr` bufSize))
+                return $ D.Skip $ (st, BufWrite fptr p (p `plusPtr` n))
         in return res
 
     step' _ (st, BufWrite fptr cur end) | cur == end =
-        return $ D.Yield (Vector fptr bufSize) (st, BufAlloc)
+        return $ D.Yield (Vector {vPtr = fptr, vLen = n, vSize = size})
+                         (st, BufAlloc)
 
     step' gst (st, BufWrite fptr cur end) = do
         res <- step (adaptState gst) st
@@ -248,17 +294,213 @@ fromWord8StreamD bufSize (D.Stream step state) =
                 let !r = accursedUnutterablePerformIO $ do
                             poke cur x
                             -- XXX do we need a touch here?
-                            return $ D.Skip (s, BufWrite fptr (cur `plusPtr` 1) end)
+                            return $ D.Skip
+                                (s, BufWrite fptr (cur `plusPtr` 1) end)
                 in r
             D.Skip s -> D.Skip (s, BufWrite fptr cur end)
             D.Stop ->
-                -- XXX resize the buffer
-                D.Yield (Vector fptr (bufSize + (cur `minusPtr` end)))
+                -- XXX resizePtr the buffer
+                D.Yield (Vector { vPtr = fptr
+                                , vLen = n + (cur `minusPtr` end)
+                                , vSize = size})
                         (st, BufStop)
 
     step' _ (_, BufStop) = return D.Stop
 
-{-# INLINE fromWord8Stream #-}
-fromWord8Stream :: (IsStream t, Monad m) => t m Word8 -> t m Vector
-fromWord8Stream str =
-    D.fromStreamD $ fromWord8StreamD defaultChunkSize (D.toStreamD str)
+--  When converting a whole stream to a single vector, we can keep adding new
+--  levels to a vector tree, creating vectors of vectors so that we do not have
+--  to keep reallocating and copying the old data to new buffers. We can later
+--  reduce the levels by compacting the tree if want to. The 'hi' argument is
+--  to raise an exception if the total size exceeds this limit, this is a
+--  safety catch so that we do not vectorize infinite streams and then run out
+--  of memory.
+--
+{-
+{-# INLINE toVector #-}
+toVector :: (IsStream t, Monad m) => Int -> t m a -> Vector a
+-- toVector chunkSize hi stream =
+toVector stream =
+-}
+
+-------------------------------------------------------------------------------
+-- Buffering primitives that do not look at the values
+-------------------------------------------------------------------------------
+
+-- These APIs can also be named as collectXXX or accumXXX or vectorizeXXX or
+-- groupXXX or batchXXX or vectorXXX
+--
+{-
+-- Wait until min elements are collected irrespective of time. After collecting
+-- minimum elements if timeout occurs return the buffer immediately else wait
+-- upto timeout or max limit.
+bufferTimedMinUpTo :: Int -> Int -> Int -> t m a -> t m (Vector a)
+bufferTimedMinUpTo lo hi time =
+
+-- This can be useful if the input stream may "suspend" before generating
+-- further output. So we can emit a vector early without waiting.
+bufferUpTo :: Int -> t m a -> t m (Vector a)
+bufferUpTo hi stream =
+
+-- wait for minimum amount to be collected but don't wait for the upper limit
+-- if the input stream suspends.
+bufferMinUpTo :: Int -> Int -> t m a -> t m (Vector a)
+bufferMinUpTo lo hi stream =
+
+-- Buffer upto a max count or until timeout occurs. If timeout occurs without a
+-- single element in the buffer it raises an exception.
+--
+bufferTimedUpTo :: Int -> Int -> t m a -> t m (Vector a)
+bufferTimedUpTo hi time =
+-}
+
+-- XXX toVectorStream
+-- | @bufferN n stream@ buffers every N elements of a stream into a Vector and
+-- return a stream of 'Vector's.
+{-# INLINE bufferN #-}
+-- bufferN :: Int -> t m a -> t m (Vector a)
+bufferN :: (IsStream t, Monad m) => Int -> t m Word8 -> t m ByteVector
+bufferN n str =
+    D.fromStreamD $ toVectorStreamD n (D.toStreamD str)
+
+{-
+-------------------------------------------------------------------------------
+-- Buffering primitives that look at the values
+-------------------------------------------------------------------------------
+
+-- XXX There could be a slew of APIs similar to the non-value aware ones that
+-- look at timestamped values in the stream and collect items based on that.
+
+-- The buffer is emitted as soon as a complete marker sequence is detected if
+-- the max limit hits before a marker is detected then an exception is raised.
+-- The emitted buffer contains the marker sequence as suffix.
+--
+bufferMarkerUpTo :: Vector a -> t m a -> t m (Vector a)
+bufferMarkerUpTo hi marker stream =
+
+-- Buffer until the next element in sequence arrives. The function argument
+-- determines the difference in sequence numebrs. For example, TCP reassembly
+-- buffer.
+bufferReorder :: (a -> a -> Int) -> t m a -> t m (Vector a)
+-}
+
+-------------------------------------------------------------------------------
+-- Compact buffers
+-------------------------------------------------------------------------------
+
+{-
+-- we can call these regroupXXX or reVectorXXX
+--
+-- Compact buffers in a stream such that each resulting buffer contains exactly
+-- N elements.
+compactN :: Int -> Int -> t m (Vector a) -> t m (Vector a)
+compactN n vectors =
+
+-- This can be useful if the input stream may "suspend" before generating
+-- further output. So we can emit a vector early without waiting. It will emit
+-- a vector of at least 1 element.
+compactUpTo :: Int -> t m (Vector a) -> t m (Vector a)
+compactUpTo hi vectors =
+
+-- wait for minimum amount to be collected but don't wait for the upper limit
+-- if the input stream suspends. But never go beyond the upper limit.
+compactMinUpTo :: Int -> Int -> t m (Vector a) -> t m (Vector a)
+compactMinUpTo lo hi vectors =
+
+-- The buffer is emitted as soon as a complete marker sequence is detected. The
+-- emitted buffer contains the sequence as suffix.
+compactUpToMarker :: Vector a -> t m (Vector a) -> t m (Vector a)
+compactUpToMarker hi marker =
+
+-- Buffer upto a max count or until timeout occurs. If timeout occurs without a
+-- single element in the buffer it raises an exception.
+compactUpToWithTimeout :: Int -> Int -> t m (Vector a) -> t m (Vector a)
+compactUpToWithTimeout hi time =
+
+-- Wait until min elements are collected irrespective of time. After collecting
+-- minimum elements if timeout occurs return the buffer immediately else wait
+-- upto timeout or max limit.
+compactInRangeWithTimeout ::
+    Int -> Int -> Int -> t m (Vector a) -> t m (Vector a)
+compactInRangeWithTimeout lo hi time =
+
+-- Compact the contiguous sequences into a single vector.
+compactToReorder :: (a -> a -> Int) -> t m (Vector a) -> t m (Vector a)
+
+-------------------------------------------------------------------------------
+-- deCompact buffers
+-------------------------------------------------------------------------------
+
+-- split buffers into smaller buffers
+-- deCompactBuffers :: Int -> Int -> t m Buffer -> t m Buffer
+-- deCompactBuffers maxSize tolerance =
+
+-------------------------------------------------------------------------------
+-- Scatter/Gather IO
+-------------------------------------------------------------------------------
+
+-- When each IO opration has a significant system overhead, it may be more
+-- efficient to do gather IO. But when the buffers are too small we may want to
+-- copy multiple of them in a single buffer rather than setting up a gather
+-- list. In that case, a gather list may have more overhead compared to just
+-- copying. If the buffer is larger than a limit we may just keep a single
+-- buffer in a gather list.
+--
+-- gatherBuffers :: Int -> t m Buffer -> t m GatherBuffer
+-- gatherBuffers maxLimit bufs =
+-}
+
+-------------------------------------------------------------------------------
+-- Nesting/Layers
+-------------------------------------------------------------------------------
+
+-- A stream of vectors can be grouped to create vectors of vectors i.e. a tree
+-- of vectors. A tree of vectors can be concated to reduce the level of the
+-- tree or turn it into a single vector.
+
+-------------------------------------------------------------------------------
+-- Elimination/folding
+-------------------------------------------------------------------------------
+
+-- XXX shall we have a ByteVector module for Word8 routines?
+
+-- | Writing a stream to a file handle
+{-# INLINE toHandle #-}
+toHandle :: Handle -> ByteVector -> IO ()
+toHandle _ Vector{..} | vLen == 0 = return ()
+toHandle h Vector{..} = withForeignPtr vPtr $ \p -> hPutBuf h p vLen
+
+-- XXX we should use overWrite/write
+{-# INLINE writeHandle #-}
+writeHandle :: MonadIO m => Handle -> SerialT m ByteVector -> m ()
+writeHandle h m = S.mapM_ (liftIO . toHandle h) m
+
+{-# INLINE fromVectorD #-}
+fromVectorD :: (Monad m, Storable a) => Vector a -> D.Stream m a
+fromVectorD Vector{..} =
+    -- XXX use foldr for buffer
+    let p = unsafeForeignPtrToPtr vPtr
+    in D.Stream step (p, p `plusPtr` vLen)
+
+    where
+
+    {-# INLINE_LATE step #-}
+    step _ (p, end) | p == end = return D.Stop
+    step _ (p, end) =
+        let !x = peekFptr vPtr p
+        in return $ D.Yield x (p `plusPtr` 1, end)
+
+    {-# INLINE peekFptr #-}
+    peekFptr fp p = accursedUnutterablePerformIO $ do
+        x <- peek p
+        touchForeignPtr fp
+        return x
+
+{-# INLINE fromVector #-}
+fromVector :: (IsStream t, Monad m, Storable a) => Vector a -> t m a
+fromVector = D.fromStreamD . fromVectorD
+
+-- XXX this should perhas go in the Prelude or another module.
+-- | Convert a stream of Word8 Vectors into a stream of Word8
+{-# INLINE vConcat #-}
+vConcat :: (IsStream t, Monad m, Storable a) => t m (Vector a) -> t m a
+vConcat = S.concatMap fromVector

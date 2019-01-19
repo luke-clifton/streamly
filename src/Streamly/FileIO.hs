@@ -20,13 +20,16 @@ module Streamly.FileIO
 
     -- * General APIs
       fromHandle
+    -- , fromHandleWith
+    -- , fromHandleLen
+    -- , fromHandleLenWith
     , toHandle
 
     -- * Seekable Devices
-    -- * Internal
-    --, fromHandleVectors
---    , fromHandleWord8
---    , toWord8Stream
+    -- , fromHandlePos
+    -- , fromHandlePosWith
+    -- , fromHandlePosLen
+    -- , fromHandlePosLenWith
     )
 where
 
@@ -55,47 +58,24 @@ import Streamly.Streams.StreamK.Type (IsStream, mkStream)
 import qualified Streamly.Streams.StreamD.Type as D
 import qualified Streamly.Streams.StreamD as D
 
-import Streamly.Vector
+import Streamly.Vector hiding (fromhandle)
+import qualified Streamly.Vector as V
 
--------------------------------------------------------------------------------
--- Reading a stream from a file handle
--------------------------------------------------------------------------------
+-- Handles perform no buffering of their own, buffering is done explicitly
+-- by the stream.
 
--- type Buffer = Vector Word8
---
 -- XXX need to test/design the API for different devices (block devices, char
 -- devices, fifos, sockets).
 
-{-# INLINE hGetVector #-}
-hGetVector :: Handle -> Int -> IO Vector
-hGetVector h size = do
-    ptr <- mallocPlainForeignPtrBytes size
-    withForeignPtr ptr $ \p -> do
-        n <- hGetBufSome h p size
-        case compare n size of
-            EQ -> return $! Vector ptr size
-            -- XXX resize only if the diff is significant
-            LT -> resizeVector p size n
-            GT -> error "Panic: hGetBufSome read more than the size of buf"
+-- | GHC memory management allocation header overhead
+allocOverhead :: Int
+allocOverhead = 2 * sizeOf (undefined :: Int)
 
-{-# INLINE fromHandleVectors #-}
-fromHandleVectors :: (IsStream t, MonadIO m) => Handle -> Int -> t m Vector
-fromHandleVectors handle bufSize = go
-  where
-    -- XXX use cons/nil instead
-    go = mkStream $ \_ yld sng _ -> do
-        buf <- liftIO $ hGetVector handle bufSize
-        if sizeOfVector buf < bufSize
-        then sng buf
-        else yld buf go
-
--------------------------------------------------------------------------------
--- Writing a stream to a file handle
--------------------------------------------------------------------------------
-
-hPutVector :: Handle -> Vector -> IO ()
-hPutVector _ (Vector _  0) = return ()
-hPutVector h (Vector fptr len) = withForeignPtr fptr $ \p -> hPutBuf h p len
+-- | Default buffer size in bytes. Account for the GHC memory allocation
+-- overhead so that the actual allocation is rounded to page boundary.
+defaultChunkSize :: Int
+defaultChunkSize = 320 * k - allocOverhead
+   where k = 1024
 
 -------------------------------------------------------------------------------
 -- File APIs exposed to users
@@ -122,6 +102,12 @@ hPutVector h (Vector fptr len) = withForeignPtr fptr $ \p -> hPutBuf h p len
 -- used. If we have to read from the file many times, it requires a path lookup
 -- each time and if the reads are concurrent each read would require a separate
 -- OS handle, which is a limited resource.
+--
+-- Handles are stateful and we would like to avoid them, but they are
+-- ubiquitous and many cases we are forced to use them. Handles like 'stdin',
+-- 'stdout', 'stderr' are very common. Though we could use @fromFile
+-- /dev/stdin@ or @fromStdin@ etc. the former is not so elegant and the later
+-- would require multiple APIs for each special handle.
 
 -- Design Notes:
 --
@@ -132,7 +118,8 @@ hPutVector h (Vector fptr len) = withForeignPtr fptr $ \p -> hPutBuf h p len
 --
 -- We could avoid specifying the end of the stream and just use "take size" on
 -- the stream, but it could be useful to avoid unnecessary readaheads beyond
--- the end point that the consumer wants.
+-- the end point that the consumer wants. Not reading more than required is
+-- especially important when reading from stdin.
 --
 -------------------------------------------------------------------------------
 -- APIs for seekable devices
@@ -210,10 +197,14 @@ fromHandlePosWith chunkSize h pos = undefined
 fromHandlePos :: (IsStream t, MonadIO m) => Handle -> Either Int -> t m Word8
 fromHandlePos = fromHandlePosWith defaultChunkSize
 
+-- XXX use RULES to seek when we drop or when we use last etc.
+-- -}
+
 -------------------------------------------------------------------------------
 -- APIs for all devices
 -------------------------------------------------------------------------------
 
+{-
 -- For non-seekable or seekable handles. For non-seekable (terminals, pipes,
 -- fifo etc.) handles we cannot use an offset to read which also means that we
 -- cannot specify an offset from the end. Therefore the APIs are simpler. But
@@ -223,7 +214,7 @@ fromHandlePos = fromHandlePosWith defaultChunkSize
 fromHandleLenWith :: (IsStream t, MonadIO m)
     => Int -> Handle -> Int -> t m Word8
 fromHandleLenWith chunkSize h len =
-    S.concatMap toWord8Stream $ fromHandleVectors chunkSize h start end
+    S.concatMap toWord8Stream $ V.fromHandle chunkSize h start end
 
 -- | Like fromHandle but we can specify how much data to read. We can achieve
 -- the same effect using "take len . fromHandle", however, in that case
@@ -247,8 +238,7 @@ fromHandleLen = fromHandleLenWith defaultChunkSize
 --
 {-# INLINE fromHandleWith #-}
 fromHandleWith :: (IsStream t, MonadIO m) => Int -> Handle -> t m Word8
-fromHandleWith chunkSize h =
-    S.concatMap toWord8Stream $ fromHandleVectors h chunkSize
+fromHandleWith chunkSize h = vConcat $ V.readHandleWith chunkSize h
 
 -- XXX for concurrent streams implement readahead IO. We can send multiple read
 -- requests at the same time. For serial case we can use async IO. We can also
@@ -259,7 +249,7 @@ fromHandle :: (IsStream t, MonadIO m) => Handle -> t m Word8
 fromHandle h = fromHandleWith defaultChunkSize h
 
 toHandle :: MonadIO m => Handle -> SerialT m Word8 -> m ()
-toHandle h m = S.mapM_ (liftIO . hPutVector h) $ fromWord8Stream m
+toHandle h m = V.writeHandle h $ bufferN defaultChunkSize m
 
 -------------------------------------------------------------------------------
 -- Stateless handle based APIs
@@ -293,11 +283,11 @@ fromHandleWord8At h chunkSize offset =
     S.concatMap toWord8Stream $ fromHandleBuffersAt h chunkSize offset
 -}
 
--- XXX this should go in Streamly.String, this will require decoding to be
--- performed. We will need a fromHandleChar as a result of decoding.
--- perhaps a separate streamly-string package that will include normalized
--- strings as well.
+-- interact
+--  XXX caolesce read requests, multiple reads into the same block can be
+--  combined into a single read request followed by a view/projection on the
+--  read block.  similalrly for write requests. requests may be expensive e.g.
+--  when you are requesting from AWS.
 --
--- fromHandleLn :: (IsStream t, MonadIO m) => IO.Handle -> t m (t m Char)
--- fromHandleLn h = go
-
+--  requests can also be reordered to batch them like elevator and then
+--  reordered back on receiving the result.
