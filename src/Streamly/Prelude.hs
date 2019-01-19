@@ -1216,8 +1216,8 @@ concatMapM f m = fromStreamD $ D.concatMapM (fmap toStreamD . f) (toStreamD m)
 --
 -- @since 0.7.0
 {-# INLINE foldGroupN #-}
-foldGroupN :: (IsStream t, Monad m)
-    => Int -> (forall n. Monad n => t n a -> n b) -> t m a -> t m b
+foldGroupN :: (IsStream t, MonadIO m)
+    => Int -> (forall n. MonadIO n => t n a -> n b) -> t m a -> t m b
 foldGroupN n f m = fromStreamD $ D.foldGroupN n (f . fromStreamD) (toStreamD m)
 
 ------------------------------------------------------------------------------

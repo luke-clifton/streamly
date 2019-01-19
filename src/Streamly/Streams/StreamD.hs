@@ -194,6 +194,7 @@ module Streamly.Streams.StreamD
     )
 where
 
+import Control.Monad.IO.Class (MonadIO)
 import Control.Monad.Trans (lift)
 import Control.Monad.Trans.State.Lazy (StateT(..), get, put)
 import Data.Maybe (fromJust, isJust)
@@ -814,9 +815,9 @@ concatMap f = concatMapM (return . f)
 -- XXX call it foldGroups/foldGroupsBy?
 {-# INLINE foldGroupN #-}
 foldGroupN
-    :: Monad m
+    :: MonadIO m
     => Int
-    -> (forall n. Monad n => Stream n a -> n b)
+    -> (forall n. MonadIO n => Stream n a -> n b)
     -> Stream m a
     -> Stream m b
 foldGroupN n f (Stream step state) =
